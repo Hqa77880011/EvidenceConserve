@@ -13,11 +13,18 @@ import numpy as np
 import psutil
 
 from . import core
+from .calibration import apply_calibration, calibrate
+from .frontend import load_frontend, object_id
 
 
 def read_jsonl(path):
     with Path(path).open(encoding="utf-8") as stream:
-        return [json.loads(line) for line in stream if line.strip()]
+        rows = [json.loads(line) for line in stream if line.strip()]
+    for row in rows:
+        for view in row.get("views", []):
+            if "image" in view:
+                view["image"] = str((Path(path).resolve().parent / view["image"]).resolve())
+    return rows
 
 
 def write_jsonl(path, rows):
@@ -63,13 +70,13 @@ def summarize(rows):
     return report
 
 
-def execute(cases, method, output):
+def execute(cases, method, output, frontend=None):
     rows = []
     process = psutil.Process()
     for case in cases:
         start_cpu = time.process_time()
         start = time.perf_counter()
-        result = core.run_case(case, method)
+        result = core.run_case(case, method, frontend=frontend)
         elapsed = time.perf_counter() - start
         cpu = time.process_time() - start_cpu
         metrics = core.score(case, result)
@@ -149,10 +156,22 @@ def main():
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--count", type=int, default=200)
     prepare.add_argument("--seed", type=int, default=17)
+    calibration = sub.add_parser("calibrate")
+    calibration.add_argument("--data", required=True)
+    calibration.add_argument("--output", required=True)
+    calibration.add_argument("--methods", nargs="+", choices=core.METHODS, default=core.METHODS[:-1])
+    calibration.add_argument("--delta", type=float, default=0.05)
+    calibration.add_argument("--minimum-coverage", type=float, default=0.1)
+    calibration.add_argument("--grid-size", type=int, default=41)
+    calibration.add_argument("--frontend-config")
+    calibration.add_argument("--development-objects", required=True,
+                             help="JSON list of every object used for fitting or configuration selection; [] only for a data-independent fixed policy")
     for name in ("run", "suite"):
         item = sub.add_parser(name)
         item.add_argument("--data", required=True)
         item.add_argument("--output", required=True)
+        item.add_argument("--calibration")
+        item.add_argument("--frontend-config")
         item.add_argument(
             "--methods",
             nargs="+",
@@ -169,11 +188,31 @@ def main():
         rows = list(core.generate(random.Random(args.seed), args.count))
         for row in rows:
             row["id"] = str(args.seed) + ":" + row["id"]
+            row["family"] = str(args.seed) + ":" + row["family"]
         write_jsonl(args.output, rows)
+    elif args.command == "calibrate":
+        if args.grid_size < 2:
+            parser.error("--grid-size must be at least two")
+        artifact = calibrate(read_jsonl(args.data), args.methods, args.delta,
+                             args.minimum_coverage, np.linspace(0, 1, args.grid_size),
+                             load_frontend(args.frontend_config),
+                             json.loads(Path(args.development_objects).read_text(encoding="utf-8")))
+        target = Path(args.output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            raise FileExistsError(str(target))
+        target.write_text(json.dumps(artifact, indent=2, allow_nan=False), encoding="utf-8")
     elif args.command in ("run", "suite"):
         cases = read_jsonl(args.data)
+        frontend = load_frontend(args.frontend_config)
+        if frontend and {object_id(case) for case in cases} & frontend.training_objects:
+            raise ValueError("Frontend training and test objects overlap")
+        artifact = json.loads(Path(args.calibration).read_text(encoding="utf-8")) if args.calibration else None
+        if any(method != "no_calibration" for method in args.methods) and artifact is None:
+            parser.error("Calibrated methods require --calibration from independent object episodes")
         for method in args.methods:
-            execute(cases, method, Path(args.output) / method)
+            selected = cases if method == "no_calibration" else apply_calibration(cases, method, artifact, frontend)
+            execute(selected, method, Path(args.output) / method, frontend)
     else:
         plot(args.inputs, args.output)
 

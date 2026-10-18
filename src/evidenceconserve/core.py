@@ -1,5 +1,7 @@
 import numpy as np
 
+from .frontend import evidence_record
+
 
 METHODS = ["evidenceconserve", "naive_sum", "no_transport", "uniform_views", "no_calibration"]
 
@@ -9,28 +11,27 @@ def overlap(left, right):
     return float((a & b).sum() / max((a | b).sum(), 1))
 
 
-def increment(evidence, visibility, acquired, case, method):
+def increment(evidence, visibility, acquired, case, method, target=None, observations=None):
     if not acquired or method == "naive_sum":
         return np.asarray(evidence), 0.0
-    overlaps = np.array([overlap(visibility, case["views"][j]["visibility"]) for j in acquired])
+    observed = observations if observations is not None else {j: case["views"][j] for j in acquired}
+    overlaps = np.array([overlap(visibility, observed[j]["visibility"]) for j in acquired])
     omega = overlaps.max()
     if overlaps.sum() == 0:
         explained = np.zeros_like(evidence, dtype=float)
     else:
         transformed = []
         for j in acquired:
-            e = np.asarray(case["views"][j]["evidence"])
-            transport = np.asarray(case["views"][j].get("transport", np.eye(len(e))))
+            e = np.asarray(observed[j]["evidence"])
+            current = case["views"][target] if target is not None else {}
+            matrix = current.get("transports", {}).get(str(j))
+            if matrix is None:
+                matrix = observed[j].get("transport")
+            transport = np.asarray(np.eye(len(e)) if matrix is None else matrix)
             transformed.append(e if method == "no_transport" else transport @ e)
         explained = np.average(np.asarray(transformed), axis=0, weights=overlaps)
     evidence = np.asarray(evidence)
     return (1 - omega) * evidence + omega * np.maximum(evidence - explained, 0), omega
-
-
-def correction(risks, losses, delta):
-    values = np.sort(np.asarray(losses) - np.asarray(risks))
-    index = int(np.ceil((len(values) + 1) * (1 - delta))) - 1
-    return float(values[index]) if 0 <= index < len(values) else 1.0
 
 
 def generate(rng, count):
@@ -62,13 +63,23 @@ def generate(rng, count):
             "alpha": 0.2,
             "minimum_views": 2,
             "value_threshold": 0.001,
-            "calibration_correction": 0.05,
         }
 
 
-def run_case(case, method):
+def run_case(case, method, frontend=None, stop=True):
+    if method not in METHODS:
+        raise ValueError("Unknown acquisition method")
+    if not 0 < case["alpha"] < 1 or case["budget"] < 1 or case["classes"] < 2:
+        raise ValueError("Require alpha in (0,1), a positive budget and at least two classes")
+    dimensions = {np.shape(view["visibility"]) for view in case["views"]}
+    if len(dimensions) > 1:
+        raise ValueError("All views must use the same surface visibility coordinates")
+    for view in case["views"]:
+        if not np.isfinite(view["cost"]) or view["cost"] <= 0 or not 0 <= view["quality"] <= 1:
+            raise ValueError("Views need positive costs and quality in [0,1]")
     evidence = np.zeros(case["classes"])
     acquired, gain_log = [], []
+    observations, decisions = {}, []
     total_cost = 0.0
     forced = True
     for step in range(case["budget"]):
@@ -76,23 +87,28 @@ def run_case(case, method):
         risk = (
             1
             - probability.max()
-            + (0 if method == "no_calibration" else case["calibration_correction"])
+            + (0 if method == "no_calibration" else case.get("calibration_correction", 1.0))
         )
         options = []
         for j, view in enumerate(case["views"]):
             if j in acquired or not view["reachable"]:
                 continue
             predicted_evidence = view.get("predicted_evidence", (3 * probability).tolist())
-            gain, _ = increment(predicted_evidence, view["visibility"], acquired, case, method)
+            predicted_record = evidence_record(dict(evidence=predicted_evidence), view, case["classes"])
+            gain, _ = increment(predicted_record["evidence"], view["visibility"], acquired, case, method, j, observations)
             following = evidence + view["quality"] * gain
             predicted = (following + 1) / (following.sum() + case["classes"])
             value = (probability.max() - predicted.max()) * -1 / (view["cost"] + 1e-8)
             options.append((float(value), -j, j))
         best = max(options, default=(0.0, 0, None))
+        eligible = step >= case["minimum_views"] and best[0] <= case["value_threshold"]
+        decisions.append(dict(views=list(acquired), raw_risk=float(1 - probability.max()),
+                              prediction=int(probability.argmax()), best_value=best[0],
+                              eligible=bool(eligible)))
         if (
-            step >= case["minimum_views"]
+            stop and (method == "no_calibration" or case.get("calibrated_stopping", False))
+            and eligible
             and risk <= case["alpha"]
-            and best[0] <= case["value_threshold"]
         ):
             forced = False
             break
@@ -100,8 +116,12 @@ def run_case(case, method):
             break
         j = min(j for _, _, j in options) if method == "uniform_views" else best[2]
         view = case["views"][j]
-        gain, omega = increment(view["evidence"], view["visibility"], acquired, case, method)
-        admitted = view["quality"] * gain
+        record = frontend.capture(case, j, observations) if frontend else evidence_record(view, view, case["classes"])
+        record = evidence_record(record, view, case["classes"])
+        effective_case = dict(case, views=list(case["views"]))
+        effective_case["views"][j] = dict(view, transports=record["transports"])
+        gain, omega = increment(record["evidence"], record["visibility"], acquired, effective_case, method, j, observations)
+        admitted = record["quality"] * gain
         evidence += admitted
         gain_log.append(
             {
@@ -112,13 +132,20 @@ def run_case(case, method):
         )
         total_cost += view["cost"]
         acquired.append(j)
+        observations[j] = record
     probability = (evidence + 1) / (evidence.sum() + case["classes"])
+    calibrated = not forced and method != "no_calibration" and case.get("calibrated_stopping", False)
     return {
         "probability": probability.tolist(),
         "views": acquired,
         "cost": total_cost,
         "forced_stop": forced,
+        "calibrated_stop": bool(calibrated),
+        "stop_kind": "forced" if forced else "calibrated" if calibrated else "uncalibrated",
+        "calibration_correction": case.get("calibration_correction") if calibrated else None,
         "gains": gain_log,
+        "decisions": decisions,
+        "observations": {str(j): record for j, record in observations.items()},
     }
 
 
@@ -133,7 +160,10 @@ def score(case, result):
         "view_count": len(result["views"]),
         "motion_cost": result["cost"],
         "forced_stop": int(result["forced_stop"]),
-        "unsafe_calibrated_stop": int(not correct) if not result["forced_stop"] else None,
+        "calibrated_stop": int(result["calibrated_stop"]),
+        "unsafe_calibrated_stop": int(not correct) if result["calibrated_stop"] else None,
+        "unsafe_uncalibrated_stop": int(not correct) if result["stop_kind"] == "uncalibrated" else None,
+        "forced_stop_error": int(not correct) if result["forced_stop"] else None,
         "duplicate_gain": float(np.mean(duplicate)) if duplicate else None,
         "new_surface_gain": float(np.mean(new)) if new else None,
         "brier": float(np.sum((p - np.eye(len(p))[label]) ** 2)),
