@@ -92,3 +92,15 @@ python -m evidenceconserve.statistics --records runs/main/evidenceconserve/recor
 ```
 
 Supply --reference with a matched record file for paired differences. Resampling uses independent case IDs, or explicit cluster IDs when provided. Repeated observations from one source unit must share cluster. Zero-event bounds refer to an event in an independent cluster.
+
+## Fixed reproduction setting
+
+Frozen numerical evidence model: independent calibration/test objects, three classes, eight candidate views, six-view budget; fixed 21-point CP grid.
+
+The checked-in entry point fixes data seeds, methods, budgets and output paths. Inspect its commands without starting any computation:
+
+```bash
+python reproduce.py --plan
+```
+
+Remove `--plan` to execute the registered pipeline in a fresh output directory. The entry point calls the existing implementation; it does not insert paper results. Installation uses the package instructions above.
