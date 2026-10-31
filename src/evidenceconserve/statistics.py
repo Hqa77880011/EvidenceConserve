@@ -16,6 +16,30 @@ def mean(values):
     return float(np.mean(valid)) if valid else None
 
 
+def aggregate(rows):
+    """Recompute nonlinear metrics after resampling complete object episodes."""
+    classes = len(rows[0]["result"]["probability"])
+    confusion = np.zeros((classes, classes), dtype=int)
+    correct = 0
+    has_labels = all("label" in row["result"] for row in rows)
+    for row in rows:
+        if "label" not in row["result"]:
+            correct += bool(row["metrics"]["accuracy"])
+            continue
+        label = row["result"]["label"]
+        prediction = int(np.argmax(row["result"]["probability"]))
+        confusion[label, prediction] += 1
+        correct += prediction == label
+    numerator = 2 * np.diag(confusion)
+    denominator = confusion.sum(0) + confusion.sum(1)
+    f1 = np.divide(numerator, denominator, out=np.zeros(classes), where=denominator > 0)
+    duplicate = mean([row["metrics"].get("duplicate_gain") for row in rows])
+    novel = mean([row["metrics"].get("new_surface_gain") for row in rows])
+    return dict(macro_f1=float(f1.mean()) if has_labels else None,
+                views_per_correct_decision=sum(len(row["result"]["views"]) for row in rows) / correct if correct else None,
+                duplicate_new_gain_ratio=duplicate / novel if duplicate is not None and novel is not None and novel > 0 else None)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--records", required=True)
@@ -25,6 +49,8 @@ def main():
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     rows = read(args.records)
+    if not rows or args.resamples < 1:
+        parser.error("Require nonempty records and a positive --resamples")
     reference = {row["id"]: row for row in read(args.reference)} if args.reference else None
     if reference is not None and set(reference) != {row["id"] for row in rows}:
         raise ValueError("Paired comparison requires identical case IDs")
@@ -86,6 +112,21 @@ def main():
                 c = sum(a == 0 and d == 1 for a, d in pairs)
                 item["mcnemar_exact_p"] = float(binomtest(b, b + c, 0.5).pvalue) if b + c else 1.0
         report[key] = item
+    point = aggregate(rows)
+    point_reference = aggregate([reference[row["id"]] for row in rows]) if reference is not None else None
+    samples = {key: [] for key in point}
+    for _ in range(args.resamples):
+        selected = [row for index in rng.integers(len(groups), size=len(groups)) for row in groups[index]]
+        measured = aggregate(selected)
+        compared = aggregate([reference[row["id"]] for row in selected]) if reference is not None else None
+        for key, value in measured.items():
+            if value is not None and (compared is None or compared[key] is not None):
+                samples[key].append(value if compared is None else value - compared[key])
+    for key, values in samples.items():
+        if values and point[key] is not None and (point_reference is None or point_reference[key] is not None):
+            report[key] = dict(mean=point[key] if point_reference is None else point[key] - point_reference[key],
+                               clusters=len(groups), bootstrap95=np.quantile(values, [.025, .975]).tolist(),
+                               valid_resamples=len(values), aggregation="recomputed on complete object resamples")
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2), encoding="utf-8")

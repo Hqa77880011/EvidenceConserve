@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -28,7 +29,8 @@ def main():
         mean = tensor.new_tensor([0.485, 0.456, 0.406])[None, :, None, None]
         std = tensor.new_tensor([0.229, 0.224, 0.225])[None, :, None, None]
         tensor = (tensor - mean) / std
-    model = torch.jit.load(args.checkpoint, map_location=args.device).eval()
+    with Path(args.checkpoint).open("rb") as stream:
+        model = torch.jit.load(stream, map_location=args.device).eval()
     with torch.inference_mode():
         output = model(tensor)
     evidence = output["evidence"] if isinstance(output, dict) else output

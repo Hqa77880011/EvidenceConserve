@@ -65,15 +65,15 @@ def summarize(rows):
             "p95": float(np.quantile(values, 0.95)),
             "p99": float(np.quantile(values, 0.99)),
         }
-    elapsed = sum(row["metrics"]["latency_ms"] for row in rows) / 1000
+    elapsed = sum(row["metrics"].get("latency_ms") or 0 for row in rows) / 1000
     legal = sum(row["metrics"].get("legal_effects", 0) for row in rows)
     report["legal_throughput_per_second"] = legal / elapsed if elapsed else None
     if rows:
         probabilities = np.asarray([row["result"]["probability"] for row in rows])
-        labels = np.asarray([row["result"]["label"] for row in rows])
+        labels = np.asarray([row["result"].get("label", -1) for row in rows])
         prediction = probabilities.argmax(1)
-        report["macro_f1"] = float(f1_score(labels, prediction, labels=np.arange(probabilities.shape[1]), average="macro", zero_division=0))
-        correct = prediction == labels
+        report["macro_f1"] = float(f1_score(labels, prediction, labels=np.arange(probabilities.shape[1]), average="macro", zero_division=0)) if (labels >= 0).all() else None
+        correct = np.asarray([bool(row["metrics"]["accuracy"]) for row in rows])
         report["views_per_correct_decision"] = sum(row["metrics"]["view_count"] for row in rows) / int(correct.sum()) if correct.any() else None
         order = np.argsort(1 - probabilities.max(1), kind="stable")
         report["risk_coverage"] = [dict(coverage=(i + 1) / len(rows), risk=float((~correct[order[:i + 1]]).mean())) for i in range(len(rows))]
@@ -83,16 +83,21 @@ def summarize(rows):
     return report
 
 
-def execute(cases, method, output, frontend=None):
+def execute(cases, method, output, frontend=None, oracle_references=None, intervention=False):
+    from .interventions import duplicate_intervention, oracle, oracle_metrics
     rows = []
     process = psutil.Process()
     for case in cases:
         start_cpu = time.process_time()
         start = time.perf_counter()
-        result = core.run_case(case, method, frontend=frontend)
+        result = oracle(case) if method == "oracle" else core.run_case(case, method, frontend=frontend)
         elapsed = time.perf_counter() - start
         cpu = time.process_time() - start_cpu
         metrics = core.score(case, result)
+        if oracle_references is not None:
+            metrics.update(oracle_metrics(case, result, oracle_references[str(case["id"])]))
+        if intervention and method != "oracle":
+            metrics.update(duplicate_intervention(case, method, result, frontend))
         metrics.update(
             latency_ms=elapsed * 1000,
             cpu_seconds=cpu,
@@ -104,7 +109,7 @@ def execute(cases, method, output, frontend=None):
                 "id": case["id"],
                 "family": case.get("family", case["id"]),
                 "method": method,
-                "cluster": case.get("cluster", case["id"]),
+                "cluster": object_id(case),
                 "result": result,
                 "metrics": metrics,
             }
@@ -177,6 +182,7 @@ def main():
     calibration.add_argument("--minimum-coverage", type=float, default=0.1)
     calibration.add_argument("--grid-size", type=int, default=41)
     calibration.add_argument("--frontend-config")
+    calibration.add_argument("--predictors", help="Frozen cached-feature predictor artifact")
     calibration.add_argument("--development-objects", required=True,
                              help="JSON list of every object used for fitting or configuration selection; [] only for a data-independent fixed policy")
     for name in ("run", "suite"):
@@ -185,10 +191,13 @@ def main():
         item.add_argument("--output", required=True)
         item.add_argument("--calibration")
         item.add_argument("--frontend-config")
+        item.add_argument("--predictors", help="Must match the frozen predictors used for calibration")
+        item.add_argument("--oracle-reference", action="store_true", help="Exact offline graph search, exponential in candidate count")
+        item.add_argument("--duplicate-intervention", action="store_true", help="Paired exact replay after first capture, fixed budget and correction")
         item.add_argument(
             "--methods",
             nargs="+",
-            choices=core.METHODS,
+            choices=core.METHODS + ["oracle"],
             default=[core.METHODS[0]] if name == "run" else core.METHODS,
         )
     item = sub.add_parser("plot")
@@ -206,10 +215,19 @@ def main():
     elif args.command == "calibrate":
         if args.grid_size < 2:
             parser.error("--grid-size must be at least two")
-        artifact = calibrate(read_jsonl(args.data), args.methods, args.delta,
+        cases = read_jsonl(args.data)
+        development = json.loads(Path(args.development_objects).read_text(encoding="utf-8"))
+        predictor = None
+        if args.predictors:
+            from .predictors import load_predictors, predict_case
+            predictor = load_predictors(args.predictors)
+            cases = [predict_case(case, predictor) for case in cases]
+            development = list(set(map(str, development)) | set(predictor["development_objects"]))
+        artifact = calibrate(cases, args.methods, args.delta,
                              args.minimum_coverage, np.linspace(0, 1, args.grid_size),
                              load_frontend(args.frontend_config),
-                             json.loads(Path(args.development_objects).read_text(encoding="utf-8")))
+                             development)
+        artifact["predictor_registration"] = None if predictor is None else predictor["registration"]
         target = Path(args.output)
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
@@ -217,15 +235,29 @@ def main():
         target.write_text(json.dumps(artifact, indent=2, allow_nan=False), encoding="utf-8")
     elif args.command in ("run", "suite"):
         cases = read_jsonl(args.data)
+        predictor = None
+        if args.predictors:
+            from .predictors import load_predictors, predict_case
+            predictor = load_predictors(args.predictors)
+            if {object_id(case) for case in cases} & set(predictor["development_objects"]):
+                raise ValueError("Predictor fitting/validation and test objects overlap")
+            cases = [predict_case(case, predictor) for case in cases]
         frontend = load_frontend(args.frontend_config)
         if frontend and {object_id(case) for case in cases} & frontend.training_objects:
             raise ValueError("Frontend training and test objects overlap")
         artifact = json.loads(Path(args.calibration).read_text(encoding="utf-8")) if args.calibration else None
-        if any(method != "no_calibration" for method in args.methods) and artifact is None:
+        registration = None if predictor is None else predictor["registration"]
+        if artifact is not None and artifact.get("predictor_registration") != registration:
+            raise ValueError("Frozen predictors differ from the calibrated policy")
+        if any(method not in ("no_calibration", "oracle") for method in args.methods) and artifact is None:
             parser.error("Calibrated methods require --calibration from independent object episodes")
+        references = None
+        if args.oracle_reference:
+            from .interventions import oracle
+            references = {str(case["id"]): oracle(case) for case in cases}
         for method in args.methods:
-            selected = cases if method == "no_calibration" else apply_calibration(cases, method, artifact, frontend)
-            execute(selected, method, Path(args.output) / method, frontend)
+            selected = cases if method in ("no_calibration", "oracle") else apply_calibration(cases, method, artifact, frontend)
+            execute(selected, method, Path(args.output) / method, frontend, references, args.duplicate_intervention)
     else:
         plot(args.inputs, args.output)
 

@@ -17,11 +17,17 @@ def increment(evidence, visibility, acquired, case, method, target=None, observa
     if not acquired:
         return np.asarray(evidence), 0.0
     observed = observations if observations is not None else {j: case["views"][j] for j in acquired}
-    overlaps = np.array([overlap(visibility, observed[j]["visibility"]) for j in acquired])
+    current = case["views"][target] if target is not None else {}
+    overlaps = np.array([current.get("predicted_overlaps", {}).get(str(j), overlap(visibility, observed[j]["visibility"])) for j in acquired])
+    if not np.isfinite(overlaps).all() or (overlaps < 0).any() or (overlaps > 1).any():
+        raise ValueError("Predicted overlap must lie in [0,1]")
     omega = overlaps.max()
     if method in ("naive_sum", "no_overlap"):
         return np.asarray(evidence), omega
-    if overlaps.sum() == 0:
+    weights = overlaps * np.array([current.get("correspondence_quality", {}).get(str(j), 1.0) for j in acquired])
+    if not np.isfinite(weights).all() or (weights < 0).any():
+        raise ValueError("Correspondence weights must be finite and nonnegative")
+    if weights.sum() == 0:
         explained = np.zeros_like(evidence, dtype=float)
     else:
         transformed = []
@@ -33,7 +39,7 @@ def increment(evidence, visibility, acquired, case, method, target=None, observa
                 matrix = observed[j].get("transport")
             transport = np.asarray(np.eye(len(e)) if matrix is None else matrix)
             transformed.append(e if method == "no_transport" else transport @ e)
-        explained = np.average(np.asarray(transformed), axis=0, weights=overlaps)
+        explained = np.average(np.asarray(transformed), axis=0, weights=weights)
     evidence = np.asarray(evidence)
     if method == "overlap_only":
         return (1 - omega) * evidence, omega
@@ -69,10 +75,11 @@ def generate(rng, count):
             "alpha": 0.2,
             "minimum_views": 2,
             "value_threshold": 0.001,
+            "visibility_is_reference": True,
         }
 
 
-def run_case(case, method, frontend=None, stop=True):
+def run_case(case, method, frontend=None, stop=True, forced_actions=None):
     if method not in METHODS:
         raise ValueError("Unknown acquisition method")
     if not 0 < case["alpha"] < 1 or case["budget"] < 1 or case["classes"] < 2:
@@ -107,7 +114,7 @@ def run_case(case, method, frontend=None, stop=True):
             predicted_evidence = view.get("predicted_evidence", (3 * probability).tolist())
             predicted_record = evidence_record(dict(evidence=predicted_evidence), view, case["classes"])
             gain, _ = increment(predicted_record["evidence"], view["visibility"], acquired, case, method, j, observations)
-            quality = 1.0 if method == "no_reliability" else view["quality"]
+            quality = 1.0 if method == "no_reliability" else view.get("predicted_quality", view["quality"])
             following = evidence + quality * gain
             predicted = (following + 1) / (following.sum() + case["classes"])
             cost = edge.get("cost", view["cost"]) if edge is not None else view["cost"]
@@ -134,6 +141,10 @@ def run_case(case, method, frontend=None, stop=True):
         if method == "random_views":
             # Fixed per-episode seed is declared before seeing labels or captures.
             j = np.random.default_rng(case.get("seed", 17) + step).choice([option[2] for option in options]).item()
+        if forced_actions and step in forced_actions:
+            j = forced_actions[step]
+            if j not in [option[2] for option in options]:
+                raise ValueError("The diagnostic intervention requested an unavailable action")
         view = case["views"][j]
         record = frontend.capture(case, j, observations) if frontend else evidence_record(view, view, case["classes"])
         record = evidence_record(record, view, case["classes"])
@@ -147,6 +158,10 @@ def run_case(case, method, frontend=None, stop=True):
                 "gain": float(admitted.sum()),
                 "duplicate": view.get("duplicate", False),
                 "overlap": omega,
+                "reference_overlap": max((overlap(view.get("reference_visibility", record["visibility"]),
+                                                    case["views"][k].get("reference_visibility", observations[k]["visibility"]))
+                                          for k in acquired), default=0.0),
+                "reference_overlap_available": bool(case.get("visibility_is_reference", False) or "reference_visibility" in view),
             }
         )
         edge = view.get("from", {}).get(str(acquired[-1])) if acquired else None
@@ -175,7 +190,7 @@ def score(case, result):
     label = case["label"]
     correct = p.argmax() == label
     duplicate = [x["gain"] for x in result["gains"] if x["duplicate"]]
-    new = [x["gain"] for x in result["gains"] if x["overlap"] < 0.1]
+    new = [x["gain"] for x in result["gains"] if x.get("reference_overlap_available", True) and x.get("reference_overlap", x["overlap"]) < 0.1]
     return {
         "accuracy": int(correct),
         "view_count": len(result["views"]),
