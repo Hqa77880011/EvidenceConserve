@@ -74,6 +74,9 @@ def load_frontend(path):
         return None
     config_path = Path(path).resolve()
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    if config.get("kind") == "native":
+        from .native import NativeBackend
+        return NativeBackend((config_path.parent / config["checkpoint"]).resolve())
     if "cwd" in config:
         config["cwd"] = str((config_path.parent / config["cwd"]).resolve())
     return CommandFrontend(config)

@@ -6,6 +6,7 @@ from .frontend import evidence_record
 METHODS = ["evidenceconserve", "naive_sum", "no_transport", "uniform_views",
            "entropy_nbv", "random_views", "overlap_only", "no_overlap",
            "no_reliability", "no_cost", "no_calibration"]
+NATIVE_METHODS = ["mc_dropout", "gennbv", "fisherrf", "set_transformer", "feature_concatenation"]
 
 
 def overlap(left, right):
@@ -80,8 +81,14 @@ def generate(rng, count):
 
 
 def run_case(case, method, frontend=None, stop=True, forced_actions=None):
-    if method not in METHODS:
+    if method not in METHODS + NATIVE_METHODS:
         raise ValueError("Unknown acquisition method")
+    native = frontend if frontend is not None and hasattr(frontend, "propose") else None
+    if method in NATIVE_METHODS and native is None:
+        raise ValueError("This learned baseline needs a trained native frontend")
+    if native is not None:
+        native.reset(case, method)
+    fusion_method = "naive_sum" if native is not None and method in ("mc_dropout", "gennbv", "fisherrf", "entropy_nbv", "uniform_views", "random_views") else method
     if not 0 < case["alpha"] < 1 or case["budget"] < 1 or case["classes"] < 2:
         raise ValueError("Require alpha in (0,1), a positive budget and at least two classes")
     dimensions = {np.shape(view["visibility"]) for view in case["views"]}
@@ -107,26 +114,39 @@ def run_case(case, method, frontend=None, stop=True, forced_actions=None):
             + (0 if method == "no_calibration" else case.get("calibration_correction", 1.0))
         )
         options = []
+        stop_values = []
         for j, view in enumerate(case["views"]):
             edge = view.get("from", {}).get(str(acquired[-1])) if acquired else None
             if j in acquired or not view["reachable"] or (edge is not None and not edge.get("reachable", True)):
                 continue
             predicted_evidence = view.get("predicted_evidence", (3 * probability).tolist())
+            if native is not None:
+                predicted_evidence = native.propose(case, j, acquired, probability)
             predicted_record = evidence_record(dict(evidence=predicted_evidence), view, case["classes"])
-            gain, _ = increment(predicted_record["evidence"], view["visibility"], acquired, case, method, j, observations)
+            predicted_case = case
+            if native is not None:
+                predicted_case = dict(case, views=list(case["views"]))
+                predicted_case["views"][j] = dict(view, transports=native.matrices(j, acquired))
+            gain, _ = increment(predicted_record["evidence"], view["visibility"], acquired, predicted_case, fusion_method, j, observations)
             quality = 1.0 if method == "no_reliability" else view.get("predicted_quality", view["quality"])
             following = evidence + quality * gain
+            if method in ("set_transformer", "feature_concatenation"):
+                following = native.aggregate(acquired, j)
             predicted = (following + 1) / (following.sum() + case["classes"])
             cost = edge.get("cost", view["cost"]) if edge is not None else view["cost"]
             reduction = predicted.max() - probability.max()
             if method == "entropy_nbv":
                 reduction = -(probability * np.log(probability)).sum() + (predicted * np.log(predicted)).sum()
             value = reduction / (1.0 if method == "no_cost" else cost + 1e-8)
+            stop_values.append(float(value))
+            if native is not None:
+                value = native.rank(j, acquired, evidence, float(value), cost)
             options.append((float(value), -j, j))
         best = max(options, default=(0.0, 0, None))
-        eligible = step >= case["minimum_views"] and best[0] <= case["value_threshold"]
+        stop_value = max(stop_values, default=0.)
+        eligible = step >= case["minimum_views"] and stop_value <= case["value_threshold"]
         decisions.append(dict(views=list(acquired), raw_risk=float(1 - probability.max()),
-                              prediction=int(probability.argmax()), best_value=best[0],
+                              prediction=int(probability.argmax()), best_value=stop_value,
                               eligible=bool(eligible)))
         if (
             stop and (method == "no_calibration" or case.get("calibrated_stopping", False))
@@ -138,6 +158,10 @@ def run_case(case, method, frontend=None, stop=True, forced_actions=None):
         if best[2] is None:
             break
         j = min(j for _, _, j in options) if method == "uniform_views" else best[2]
+        if step == 0 and native is not None:
+            j = int(case.get("start_view", min(option[2] for option in options)))
+            if j not in [option[2] for option in options]:
+                raise ValueError("Registered start_view is not a legal initial action")
         if method == "random_views":
             # Fixed per-episode seed is declared before seeing labels or captures.
             j = np.random.default_rng(case.get("seed", 17) + step).choice([option[2] for option in options]).item()
@@ -150,8 +174,10 @@ def run_case(case, method, frontend=None, stop=True, forced_actions=None):
         record = evidence_record(record, view, case["classes"])
         effective_case = dict(case, views=list(case["views"]))
         effective_case["views"][j] = dict(view, transports=record["transports"])
-        gain, omega = increment(record["evidence"], record["visibility"], acquired, effective_case, method, j, observations)
+        gain, omega = increment(record["evidence"], record["visibility"], acquired, effective_case, fusion_method, j, observations)
         admitted = (1.0 if method == "no_reliability" else record["quality"]) * gain
+        if method in ("set_transformer", "feature_concatenation"):
+            admitted = native.aggregate(acquired + [j]) - evidence
         evidence += admitted
         gain_log.append(
             {
@@ -170,7 +196,7 @@ def run_case(case, method, frontend=None, stop=True, forced_actions=None):
         observations[j] = record
     probability = (evidence + 1) / (evidence.sum() + case["classes"])
     calibrated = not forced and method != "no_calibration" and case.get("calibrated_stopping", False)
-    return {
+    result = {
         "probability": probability.tolist(),
         "label": case["label"],
         "views": acquired,
@@ -183,6 +209,9 @@ def run_case(case, method, frontend=None, stop=True, forced_actions=None):
         "decisions": decisions,
         "observations": {str(j): record for j, record in observations.items()},
     }
+    if native is not None:
+        result["native_diagnostics"] = native.diagnostics
+    return result
 
 
 def score(case, result):

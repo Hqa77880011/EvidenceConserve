@@ -74,7 +74,41 @@ For imported episodes, `views[j].from[str(previous_view)]` can declare directed 
 
 To use a trained visual encoder, pass `--frontend-config` to both calibration and execution. The JSON contains an argv `command`, optional `cwd`, and all `training_objects`. `python -m evidenceconserve.torchscript_frontend --checkpoint PATH --image-size 224` accepts a captured image request on stdin and returns nonnegative class evidence; optional `--imagenet-normalize` must match encoder training. The calibration artifact records frontend configuration and prohibits development/calibration/test object overlap.
 
-CO3D, OmniObject3D and MVImgNet images, trained image encoders, pose/transport estimators and physical view graphs are not bundled. The cached-feature candidate/quality/overlap predictors, exact finite-graph oracle and duplicate-stop diagnostic are implemented below. GenNBV, FisherRF, MC-dropout and Set Transformer model training/inference remain external, with a common complete-trace calibration/evaluation adapter. `entropy_nbv` is the entropy selector for the supplied candidate-evidence model. Original raw experiment runs/checkpoints were not found; this revision does not establish manuscript performance, physical energy or hardware capture timing.
+The native RGB workflow below trains an encoder, pose-conditioned transport, candidate predictor and learned baselines. The numerical generator remains a fast finite-model control. CO3D, OmniObject3D and MVImgNet images, physical view graphs and original experiment checkpoints/runs are not bundled. Small generated checks establish executable training/evaluation, not manuscript performance or hardware capture timing.
+
+## Native RGB training and acquisition
+
+```bash
+python -m pip install -e '.[vision]'
+python -m evidenceconserve.native train --data data/episodes.jsonl --output checkpoints/native
+```
+
+Each episode retains the ordinary graph, budget and stopping fields and adds `object_id`, `split` (`train`, `policy_validation`, `calibration`, `test`), `start_view` and `voxel_shape`. Each view supplies RGB `image`, `image_shape: [height,width]`, `intrinsics` (3x3), `pose: [world_x,world_y,world_z,roll,pitch,yaw]` with radians, shared-coordinate `visibility`/quality, and `voxel_path` (a declared coarse occupancy grid). Directed reachability/cost uses the existing `from` contract. Images and occupancy from a candidate are opened only after capture; known camera rays/poses and acquired history drive proposal/ranking. Training object IDs cannot cross splits. RGB normalization fits train pixels only; validation alone selects model checkpoints; calibration/test images are never used for fitting.
+
+Create `configs/native.json` containing `{"kind":"native","checkpoint":"../checkpoints/native/native.pt"}`; checkpoint paths resolve relative to that config file. Supply disjoint calibration/test subsets of the episodes and a development list containing the train/validation object IDs (the native checkpoint also registers them):
+
+```bash
+python -m evidenceconserve calibrate --data data/calibration.jsonl --frontend-config configs/native.json --development-objects data/development.json --methods evidenceconserve mc_dropout gennbv fisherrf set_transformer feature_concatenation --output checkpoints/native-calibration.json
+python -m evidenceconserve suite --data data/test.jsonl --frontend-config configs/native.json --calibration checkpoints/native-calibration.json --methods evidenceconserve mc_dropout gennbv fisherrf set_transformer feature_concatenation --output runs/native
+```
+
+The complete native `evidenceconserve` method uses ResNet18/Dirichlet evidence, learned pose transport and the existing residual/overlap/reliability update, with the same calibrated stopping protocol. Model defaults are three-channel 224px inputs, 64 feature/hidden dimensions, dropout .2, AdamW 3e-4, up to 150 epochs and patience 15; `--config` accepts JSON overrides (see `native_training.DEFAULTS`). Transport is a positive relative-pose-conditioned KxK matrix, forced to identity at equal poses, fitted on overlapping train view pairs against frozen encoder evidence with a small identity penalty. Candidate dynamics predicts evidence and embedding from a known candidate pose, relative pose, acquired mean features/posterior and novelty. The explicit architectures, losses and widths fill details not specified in the manuscript; they are implementation choices rather than recovered original models.
+
+| Native comparison | Executable algorithm and declared adaptation |
+|---|---|
+| `set_transformer` | Original upstream ISAB/ISAB/PMA attention modules, trained with the evidential classification loss on view prefixes; permutation invariant |
+| `feature_concatenation` | Ordered padded feature concatenation plus trained evidential head |
+| `mc_dropout` | Stochastic candidate-dynamics dropout; BALD mutual information `H(mean p)-mean H(p)` divided by charged cost, without candidate RGB |
+| `gennbv` | Released GenNBV occupancy-Conv3D and periodic pose-history encoder; actor/critic and clipped PPO with GAE learn coverage/path/terminal reward on the common legal finite graph. This is the manuscript's GenNBV-style graph adaptation, not Isaac Gym drone training |
+| `fisherrf` | Differentiable emission/absorption radiance MLP fits captured RGB online; squared RGB Jacobians yield diagonal Fisher and the original `sum(H_candidate/(H_observed+lambda))` criterion. CPU MLP replaces the upstream custom 3D Gaussian rasterizer; the criterion is implemented, original 3DGS-backend reproduction remains separate |
+
+All comparisons share the visual evidence encoder, graph, capture budget and method-specific frozen stopping calibration. Candidate ranking and predicted risk reduction are distinct: learned acquisition priorities select views, while the same evidence-risk model governs eligibility. The start view is common and exogenous. GenNBV simulation rewards may use archived train/validation coverage; deployment consumes acquired occupancy only. FisherRF resets its field prior for every episode and trains only on acquired RGB. Licenses, upstream sources and exact adaptation details are retained in [third_party/NOTICE.md](src/evidenceconserve/third_party/NOTICE.md).
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 MKL_THREADING_LAYER=SEQUENTIAL python verify_native.py --output runs/native-functional
+```
+
+On 2026-11-01 the generated five-object check trained every component (including actual PPO updates), independently calibrated and replayed all six native methods, checked nonzero gradients and trainable-weight updates, rejected split overlap, verified no calibration/test fitting images and no uncaptured inference images, saved/loaded all six learned modules with atol 1e-7, checked exact equal-pose transport, Set permutation invariance and the analytic constant-density Fisher diagonal `6*(1-exp(-1))² = 2.3974583`. Online RF gradients were nonzero. Generated cases and one-epoch settings are functionality checks, not performance comparisons.
 
 ## Cached-feature predictor lifecycle
 
@@ -111,6 +145,8 @@ python -m evidenceconserve.external evaluate --data data/gennbv-test.jsonl --pol
 python -m evidenceconserve plot --inputs runs/gennbv runs/learned/evidenceconserve --output figures/comparison
 ```
 
-Actual GenNBV/FisherRF/MC-dropout/Set-Transformer architecture training, their original inference/export scripts and checkpoints are still required externally, so their algorithm reproduction remains incomplete. The adapter supplies an executable matched evaluation route without substituting a different algorithm.
+This trace route remains available for original external checkpoints and simulators. Native implementations above execute their stated algorithms and graph/renderer adaptations directly; an external trace alone does not establish native reproduction. The optional Active Implicit one-shot baseline and the upstream Isaac Gym/3DGS backends have not been reproduced by this revision.
+
+The original one-shot source is publicly available at [AIR-OSVP](https://github.com/psc0628/AIR-OSVP), revision `6847c0a57ca3b4e9d9a82d4cbf12f08074f71a89`; it must not be confused with the different ActiveImplicitRecon paper. Its [installation](https://github.com/psc0628/AIR-OSVP/blob/main/poco_pointr/README.md) requires the original POCO and PoinTr source trees; `pointrVP/models/COSC.py` directly imports `pointnet2_ops` and the compiled Chamfer extension. Public data/checkpoint links exist, so checkpoint availability is not the reason for leaving this optional integration open. This CPU revision has not built or validated that point-cloud/extension pipeline or mapped its batch-view output onto the common charged graph. The optional original baseline therefore remains incomplete, while the native RGB baseline ladder above is executable. Original FisherRF needs its [modified CUDA rasterizer/knn/Hessian extensions](https://github.com/JiangWenPL/FisherRF#environment-setup); this revision implements its Fisher algorithm with the explicitly declared CPU radiance backend.
 
 The extended CPU smoke also passed learned-head fitting/save/load, registration JSON, independent object calibration and replay, exact oracle hand cost/regret and inserted-copy zero increment. External adapters were checked with explicitly generated functionality fixtures; these are not runs of the named learned baselines.

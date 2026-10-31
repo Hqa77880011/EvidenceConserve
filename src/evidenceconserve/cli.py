@@ -177,7 +177,7 @@ def main():
     calibration = sub.add_parser("calibrate")
     calibration.add_argument("--data", required=True)
     calibration.add_argument("--output", required=True)
-    calibration.add_argument("--methods", nargs="+", choices=core.METHODS, default=core.METHODS[:-1])
+    calibration.add_argument("--methods", nargs="+", choices=core.METHODS + core.NATIVE_METHODS, default=core.METHODS[:-1])
     calibration.add_argument("--delta", type=float, default=0.05)
     calibration.add_argument("--minimum-coverage", type=float, default=0.1)
     calibration.add_argument("--grid-size", type=int, default=41)
@@ -197,7 +197,7 @@ def main():
         item.add_argument(
             "--methods",
             nargs="+",
-            choices=core.METHODS + ["oracle"],
+            choices=core.METHODS + core.NATIVE_METHODS + ["oracle"],
             default=[core.METHODS[0]] if name == "run" else core.METHODS,
         )
     item = sub.add_parser("plot")
