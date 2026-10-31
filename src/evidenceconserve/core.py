@@ -3,7 +3,9 @@ import numpy as np
 from .frontend import evidence_record
 
 
-METHODS = ["evidenceconserve", "naive_sum", "no_transport", "uniform_views", "no_calibration"]
+METHODS = ["evidenceconserve", "naive_sum", "no_transport", "uniform_views",
+           "entropy_nbv", "random_views", "overlap_only", "no_overlap",
+           "no_reliability", "no_cost", "no_calibration"]
 
 
 def overlap(left, right):
@@ -12,11 +14,13 @@ def overlap(left, right):
 
 
 def increment(evidence, visibility, acquired, case, method, target=None, observations=None):
-    if not acquired or method == "naive_sum":
+    if not acquired:
         return np.asarray(evidence), 0.0
     observed = observations if observations is not None else {j: case["views"][j] for j in acquired}
     overlaps = np.array([overlap(visibility, observed[j]["visibility"]) for j in acquired])
     omega = overlaps.max()
+    if method in ("naive_sum", "no_overlap"):
+        return np.asarray(evidence), omega
     if overlaps.sum() == 0:
         explained = np.zeros_like(evidence, dtype=float)
     else:
@@ -31,6 +35,8 @@ def increment(evidence, visibility, acquired, case, method, target=None, observa
             transformed.append(e if method == "no_transport" else transport @ e)
         explained = np.average(np.asarray(transformed), axis=0, weights=overlaps)
     evidence = np.asarray(evidence)
+    if method == "overlap_only":
+        return (1 - omega) * evidence, omega
     return (1 - omega) * evidence + omega * np.maximum(evidence - explained, 0), omega
 
 
@@ -77,6 +83,10 @@ def run_case(case, method, frontend=None, stop=True):
     for view in case["views"]:
         if not np.isfinite(view["cost"]) or view["cost"] <= 0 or not 0 <= view["quality"] <= 1:
             raise ValueError("Views need positive costs and quality in [0,1]")
+        for edge in view.get("from", {}).values():
+            cost = edge.get("cost", view["cost"])
+            if not np.isfinite(cost) or cost <= 0:
+                raise ValueError("Directed motion costs must be finite and positive")
     evidence = np.zeros(case["classes"])
     acquired, gain_log = [], []
     observations, decisions = {}, []
@@ -91,14 +101,20 @@ def run_case(case, method, frontend=None, stop=True):
         )
         options = []
         for j, view in enumerate(case["views"]):
-            if j in acquired or not view["reachable"]:
+            edge = view.get("from", {}).get(str(acquired[-1])) if acquired else None
+            if j in acquired or not view["reachable"] or (edge is not None and not edge.get("reachable", True)):
                 continue
             predicted_evidence = view.get("predicted_evidence", (3 * probability).tolist())
             predicted_record = evidence_record(dict(evidence=predicted_evidence), view, case["classes"])
             gain, _ = increment(predicted_record["evidence"], view["visibility"], acquired, case, method, j, observations)
-            following = evidence + view["quality"] * gain
+            quality = 1.0 if method == "no_reliability" else view["quality"]
+            following = evidence + quality * gain
             predicted = (following + 1) / (following.sum() + case["classes"])
-            value = (probability.max() - predicted.max()) * -1 / (view["cost"] + 1e-8)
+            cost = edge.get("cost", view["cost"]) if edge is not None else view["cost"]
+            reduction = predicted.max() - probability.max()
+            if method == "entropy_nbv":
+                reduction = -(probability * np.log(probability)).sum() + (predicted * np.log(predicted)).sum()
+            value = reduction / (1.0 if method == "no_cost" else cost + 1e-8)
             options.append((float(value), -j, j))
         best = max(options, default=(0.0, 0, None))
         eligible = step >= case["minimum_views"] and best[0] <= case["value_threshold"]
@@ -115,13 +131,16 @@ def run_case(case, method, frontend=None, stop=True):
         if best[2] is None:
             break
         j = min(j for _, _, j in options) if method == "uniform_views" else best[2]
+        if method == "random_views":
+            # Fixed per-episode seed is declared before seeing labels or captures.
+            j = np.random.default_rng(case.get("seed", 17) + step).choice([option[2] for option in options]).item()
         view = case["views"][j]
         record = frontend.capture(case, j, observations) if frontend else evidence_record(view, view, case["classes"])
         record = evidence_record(record, view, case["classes"])
         effective_case = dict(case, views=list(case["views"]))
         effective_case["views"][j] = dict(view, transports=record["transports"])
         gain, omega = increment(record["evidence"], record["visibility"], acquired, effective_case, method, j, observations)
-        admitted = record["quality"] * gain
+        admitted = (1.0 if method == "no_reliability" else record["quality"]) * gain
         evidence += admitted
         gain_log.append(
             {
@@ -130,13 +149,15 @@ def run_case(case, method, frontend=None, stop=True):
                 "overlap": omega,
             }
         )
-        total_cost += view["cost"]
+        edge = view.get("from", {}).get(str(acquired[-1])) if acquired else None
+        total_cost += edge.get("cost", view["cost"]) if edge is not None else view["cost"]
         acquired.append(j)
         observations[j] = record
     probability = (evidence + 1) / (evidence.sum() + case["classes"])
     calibrated = not forced and method != "no_calibration" and case.get("calibrated_stopping", False)
     return {
         "probability": probability.tolist(),
+        "label": case["label"],
         "views": acquired,
         "cost": total_cost,
         "forced_stop": forced,
@@ -159,6 +180,7 @@ def score(case, result):
         "accuracy": int(correct),
         "view_count": len(result["views"]),
         "motion_cost": result["cost"],
+        "capture_seconds": float(sum(case["views"][j].get("capture_seconds", 0) for j in result["views"])),
         "forced_stop": int(result["forced_stop"]),
         "calibrated_stop": int(result["calibrated_stop"]),
         "unsafe_calibrated_stop": int(not correct) if result["calibrated_stop"] else None,

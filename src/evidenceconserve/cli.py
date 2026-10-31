@@ -15,6 +15,7 @@ import psutil
 from . import core
 from .calibration import apply_calibration, calibrate
 from .frontend import load_frontend, object_id
+from sklearn.metrics import f1_score
 
 
 def read_jsonl(path):
@@ -67,6 +68,18 @@ def summarize(rows):
     elapsed = sum(row["metrics"]["latency_ms"] for row in rows) / 1000
     legal = sum(row["metrics"].get("legal_effects", 0) for row in rows)
     report["legal_throughput_per_second"] = legal / elapsed if elapsed else None
+    if rows:
+        probabilities = np.asarray([row["result"]["probability"] for row in rows])
+        labels = np.asarray([row["result"]["label"] for row in rows])
+        prediction = probabilities.argmax(1)
+        report["macro_f1"] = float(f1_score(labels, prediction, labels=np.arange(probabilities.shape[1]), average="macro", zero_division=0))
+        correct = prediction == labels
+        report["views_per_correct_decision"] = sum(row["metrics"]["view_count"] for row in rows) / int(correct.sum()) if correct.any() else None
+        order = np.argsort(1 - probabilities.max(1), kind="stable")
+        report["risk_coverage"] = [dict(coverage=(i + 1) / len(rows), risk=float((~correct[order[:i + 1]]).mean())) for i in range(len(rows))]
+        duplicate = report.get("duplicate_gain", {}).get("mean")
+        new = report.get("new_surface_gain", {}).get("mean")
+        report["duplicate_new_gain_ratio"] = duplicate / new if duplicate is not None and new is not None and new > 0 else None
     return report
 
 
