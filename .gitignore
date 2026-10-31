@@ -13,4 +13,5 @@ figures/
 *.pth
 .ruff_cache/
 *.joblib
+.deps/
 
