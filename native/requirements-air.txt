@@ -1,0 +1,25 @@
+--find-links https://data.pyg.org/whl/torch-2.0.0+cu118.html
+numpy==1.26.4
+scipy==1.15.3
+torch-geometric==2.5.3
+torch-scatter==2.1.2+pt20cu118
+torch-cluster==1.6.3+pt20cu118
+open3d==0.18.0
+timm==0.4.5
+easydict==1.13
+einops==0.8.2
+h5py==3.16.0
+matplotlib==3.10.9
+pandas==2.2.3
+scikit-image==0.24.0
+scikit-learn==1.6.1
+tensorboardX==2.6.5
+tensorboard==2.21.0
+transforms3d==0.4.2
+objprint==0.3.0
+pykdtree==1.4.1
+plyfile==1.0.3
+trimesh==4.6.13
+Cython==0.29.37
+pyyaml==6.0.3
+tqdm==4.70.1
