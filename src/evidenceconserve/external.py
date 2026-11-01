@@ -1,8 +1,4 @@
-"""Calibrate and score complete traces exported by independently trained baselines.
-
-This is an output adapter for GenNBV/FisherRF/MC-dropout/Set-Transformer models,
-not a replacement implementation of their training or inference algorithms.
-"""
+"""Calibrate and score traces exported by trained acquisition baselines."""
 
 import argparse
 import json

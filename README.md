@@ -10,7 +10,7 @@ Requires Python `>=3.11`. Run from the repository root in an activated environme
 python -m pip install -e .
 ```
 
-Validated on Python 3.13.5, NumPy 2.1.3, SciPy 1.15.3 and scikit-learn 1.6.1 on CPU. `python -m evidenceconserve.smoke --output runs/smoke` checks JSONL loading, all 11 policies, episode calibration save/load, deterministic replay, exact-duplicate zero gain, positive disjoint-surface gain, hand-calculated Brier/NLL/F1 and plotting. On 2026-11-01 all checks passed; four generated test episodes per policy were used. These generated cases check functionality and do not reproduce the paper results.
+Offline check: `python -m evidenceconserve.smoke --output runs/smoke` uses generated objects to check 11 policies, stopping calibration, replay, evidence gains, metrics and plotting.
 
 ## Data
 
@@ -57,9 +57,9 @@ Plotting writes `figures/summary.csv` and metric PNGs. Statistical intervals can
 python -m evidenceconserve.statistics --records runs/main/evidenceconserve/records.jsonl --output results/intervals.json
 ```
 
-## Method and metric mapping
+## Components and metrics
 
-| Paper component | Entry | Command / convention |
+| Component / metric | Entry | Command / convention |
 |---|---|---|
 | Overlap, explained evidence, reliability-weighted residual | `core.increment`, `core.run_case` | `run`; exact replay admits zero support, identity transport is explicit ablation |
 | Frozen-policy object-episode stopping | `calibration.calibrate`, `select_correction` | `calibrate`; simultaneous fixed-grid Clopper-Pearson bound, calibration objects disjoint from development/test |
@@ -68,13 +68,13 @@ python -m evidenceconserve.statistics --records runs/main/evidenceconserve/recor
 | Duplicate/new-surface gains, gain ratio, path cost, capture duration, latency and RSS | `core.score`, `cli.execute` | `run`; `capture_seconds` defaults to zero when no timing is supplied |
 | Curves and bootstrap intervals | `cli.plot`, `statistics` | commands above |
 
-For imported episodes, `views[j].from[str(previous_view)]` can declare directed `reachable` and `cost` metadata. Missing directed metadata uses the candidate's fixed reachability/cost. Visibility coordinates must align across views. Candidate `predicted_evidence` is supplied before capture; `evidence` is revealed only after the selected action. The default predictor `3 * current_probability` is a fixed numerical convention, not the paper's learned candidate model. Seed defaults to 17 for the random selector and is independent of labels.
+For imported episodes, `views[j].from[str(previous_view)]` can declare directed `reachable` and `cost` metadata. Missing directed metadata uses the candidate's fixed reachability/cost. Visibility coordinates must align across views. Candidate `predicted_evidence` is supplied before capture; `evidence` is revealed only after the selected action. The numerical default predictor is `3 * current_probability`. Seed defaults to 17 for the random selector and is independent of labels.
 
-## Visual data and implementation scope
+## Visual encoder inputs
 
 To use a trained visual encoder, pass `--frontend-config` to both calibration and execution. The JSON contains an argv `command`, optional `cwd`, and all `training_objects`. `python -m evidenceconserve.torchscript_frontend --checkpoint PATH --image-size 224` accepts a captured image request on stdin and returns nonnegative class evidence; optional `--imagenet-normalize` must match encoder training. The calibration artifact records frontend configuration and prohibits development/calibration/test object overlap.
 
-The native RGB workflow below trains an encoder, pose-conditioned transport, candidate predictor and learned baselines. The numerical generator remains a fast finite-model control. CO3D, OmniObject3D and MVImgNet images, physical view graphs and original experiment checkpoints/runs are not bundled. Small generated checks establish executable training/evaluation, not manuscript performance or hardware capture timing.
+The RGB workflow trains an evidence encoder, pose-conditioned transport, candidate predictor and acquisition policies. Supply licensed images with physical view graphs; the bundled generator provides a finite-model check.
 
 ## Native RGB training and acquisition
 
@@ -92,23 +92,21 @@ python -m evidenceconserve calibrate --data data/calibration.jsonl --frontend-co
 python -m evidenceconserve suite --data data/test.jsonl --frontend-config configs/native.json --calibration checkpoints/native-calibration.json --methods evidenceconserve mc_dropout gennbv fisherrf set_transformer feature_concatenation --output runs/native
 ```
 
-The complete native `evidenceconserve` method uses ResNet18/Dirichlet evidence, learned pose transport and the existing residual/overlap/reliability update, with the same calibrated stopping protocol. Model defaults are three-channel 224px inputs, 64 feature/hidden dimensions, dropout .2, AdamW 3e-4, up to 150 epochs and patience 15; `--config` accepts JSON overrides (see `native_training.DEFAULTS`). Transport is a positive relative-pose-conditioned KxK matrix, forced to identity at equal poses, fitted on overlapping train view pairs against frozen encoder evidence with a small identity penalty. Candidate dynamics predicts evidence and embedding from a known candidate pose, relative pose, acquired mean features/posterior and novelty. The explicit architectures, losses and widths fill details not specified in the manuscript; they are implementation choices rather than recovered original models.
+The complete native `evidenceconserve` method uses ResNet18/Dirichlet evidence, learned pose transport and the existing residual/overlap/reliability update, with the same calibrated stopping protocol. Model defaults are three-channel 224px inputs, 64 feature/hidden dimensions, dropout .2, AdamW 3e-4, up to 150 epochs and patience 15; `--config` accepts JSON overrides (see `native_training.DEFAULTS`). Transport is a positive relative-pose-conditioned KxK matrix, forced to identity at equal poses, fitted on overlapping train view pairs against frozen encoder evidence with a small identity penalty. Candidate dynamics predicts evidence and embedding from a known candidate pose, relative pose, acquired mean features/posterior and novelty.
 
 | Native comparison | Executable algorithm and declared adaptation |
 |---|---|
 | `set_transformer` | Original upstream ISAB/ISAB/PMA attention modules, trained with the evidential classification loss on view prefixes; permutation invariant |
 | `feature_concatenation` | Ordered padded feature concatenation plus trained evidential head |
 | `mc_dropout` | Stochastic candidate-dynamics dropout; BALD mutual information `H(mean p)-mean H(p)` divided by charged cost, without candidate RGB |
-| `gennbv` | Released GenNBV occupancy-Conv3D and periodic pose-history encoder; actor/critic and clipped PPO with GAE learn coverage/path/terminal reward on the common legal finite graph. This is the manuscript's GenNBV-style graph adaptation, not Isaac Gym drone training |
-| `fisherrf` | Differentiable emission/absorption radiance MLP fits captured RGB online; squared RGB Jacobians yield diagonal Fisher and the original `sum(H_candidate/(H_observed+lambda))` criterion. CPU MLP replaces the upstream custom 3D Gaussian rasterizer; the criterion is implemented, original 3DGS-backend reproduction remains separate |
+| `gennbv` | Released GenNBV occupancy-Conv3D and periodic pose-history encoder; actor/critic and clipped PPO with GAE learn coverage/path/terminal reward on the common legal finite graph. Finite-graph PPO with the released GenNBV encoder |
+| `fisherrf` | Differentiable emission/absorption radiance MLP fits captured RGB online; squared RGB Jacobians yield diagonal Fisher and the original `sum(H_candidate/(H_observed+lambda))` criterion. Uses a CPU radiance MLP backend |
 
 All comparisons share the visual evidence encoder, graph, capture budget and method-specific frozen stopping calibration. Candidate ranking and predicted risk reduction are distinct: learned acquisition priorities select views, while the same evidence-risk model governs eligibility. The start view is common and exogenous. GenNBV simulation rewards may use archived train/validation coverage; deployment consumes acquired occupancy only. FisherRF resets its field prior for every episode and trains only on acquired RGB. Licenses, upstream sources and exact adaptation details are retained in [third_party/NOTICE.md](src/evidenceconserve/third_party/NOTICE.md).
 
 ```bash
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 MKL_THREADING_LAYER=SEQUENTIAL python verify_native.py --output runs/native-functional
 ```
-
-On 2026-11-01 the generated five-object check trained every component (including actual PPO updates), independently calibrated and replayed all six native methods, checked nonzero gradients and trainable-weight updates, rejected split overlap, verified no calibration/test fitting images and no uncaptured inference images, saved/loaded all six learned modules with atol 1e-7, checked exact equal-pose transport, Set permutation invariance and the analytic constant-density Fisher diagonal `6*(1-exp(-1))² = 2.3974583`. Online RF gradients were nonzero. Generated cases and one-epoch settings are functionality checks, not performance comparisons.
 
 ## Cached-feature predictor lifecycle
 
@@ -120,7 +118,7 @@ python -m evidenceconserve calibrate --data data/calibration.jsonl --predictors 
 python -m evidenceconserve run --data data/test.jsonl --predictors checkpoints/predictors/predictors.joblib --calibration checkpoints/learned-calibration.json --output runs/learned
 ```
 
-Each view supplies `candidate_features[F]` and `overlap_features[str(previous_view_index)]` vectors. Predicted evidence/quality score uncaptured actions; learned overlap and optional `correspondence_quality[str(j)]` weight the explained evidence update. Input and target scalers fit training rows only. Widths {32,64}, regularization {1e-4,1e-3}, seeds {13,37,73}, a 150-epoch cap and patience 15 use policy-validation MSE for checkpoint/configuration selection. These small-MLP choices implement the unspecified predictor details rather than recover original weights. Ensemble spread is descriptive uncertainty, not a calibrated risk bound. The calibration artifact records predictor registration and excludes its train/validation objects from calibration and test.
+Each view supplies `candidate_features[F]` and `overlap_features[str(previous_view_index)]` vectors. Predicted evidence/quality score uncaptured actions; learned overlap and optional `correspondence_quality[str(j)]` weight the explained evidence update. Input and target scalers fit training rows only. Widths {32,64}, regularization {1e-4,1e-3}, seeds {13,37,73}, a 150-epoch cap and patience 15 use policy-validation MSE for checkpoint/configuration selection. Ensemble spread is descriptive uncertainty, not a calibrated risk bound. The calibration artifact records predictor registration and excludes its train/validation objects from calibration and test.
 
 ## Oracle and duplicate intervention
 
@@ -131,7 +129,7 @@ python -m evidenceconserve run --data data/test.jsonl --methods oracle --output 
 
 The privileged `interventions.oracle` reads archived evidence/labels only for evaluation, enumerates reachable simple paths under the same graph and capture budget, and minimizes charged cost among correct decisions satisfying the raw target-risk and minimum-view rule. Its stop is not a calibrated certificate. `oracle_regret` is policy cost minus oracle cost only when both satisfy that declared low-risk/correct criterion; other cases remain null. Error regret is reported separately. If no such path exists, the fallback maximizes true-class support. Exact search is exponential and defaults to at most ten candidates; set the episode's `oracle_max_views` explicitly for a larger search.
 
-The duplicate intervention forces one identical copy after the first capture, retaining the capture budget, original policy and frozen correction. `duplicate_stop_time_change` counts the difference in captures, `duplicate_increment` measures support admitted on the inserted copy, and cost/prediction changes are logged. This perturbed sequence is a diagnostic and does not inherit the original calibration guarantee. New-surface gain uses `reference_visibility` or an explicitly declared `visibility_is_reference=true`; it is null when no reference overlap is supplied. The bundled finite generator declares reference geometry and uses a development target alpha=.2; set alpha=.03 in imported paper-protocol episodes.
+The duplicate intervention forces one identical copy after the first capture, retaining the capture budget, original policy and frozen correction. `duplicate_stop_time_change` counts the difference in captures, `duplicate_increment` measures support admitted on the inserted copy, and cost/prediction changes are logged. This perturbed sequence is a diagnostic and does not inherit the original calibration guarantee. New-surface gain uses `reference_visibility` or an explicitly declared `visibility_is_reference=true`; it is null when no reference overlap is supplied. The bundled finite generator declares reference geometry and uses a development target alpha=.2; set the desired target alpha in imported episodes.
 
 ## Externally trained baseline trace adapter
 
@@ -145,13 +143,13 @@ python -m evidenceconserve.external evaluate --data data/gennbv-test.jsonl --pol
 python -m evidenceconserve plot --inputs runs/gennbv runs/learned/evidenceconserve --output figures/comparison
 ```
 
-This trace route remains available for original external checkpoints and simulators. Native implementations above execute their stated algorithms and graph/renderer adaptations directly; an external trace alone does not establish native reproduction. Original AIR-OSVP CUDA execution is validated below. The upstream Isaac Gym/3DGS backends remain distinct from the declared graph/CPU-radiance adaptations.
+The trace adapter evaluates external checkpoints and simulators. Native finite-graph, CPU-radiance and AIR-OSVP entries use their respective backends.
 
-The original one-shot source is publicly available at [AIR-OSVP](https://github.com/psc0628/AIR-OSVP), revision `6847c0a57ca3b4e9d9a82d4cbf12f08074f71a89`; it must not be confused with the different ActiveImplicitRecon paper. Its [installation](https://github.com/psc0628/AIR-OSVP/blob/main/poco_pointr/README.md) requires original POCO/PoinTr and compiled Pointnet2/Chamfer. Those dependencies now build and execute in the private Linux CUDA environment below, with public original weights. The native pipeline and unchanged-batch graph charging are exercised on one public capture. Full original RGB/physical-graph evaluation episodes are still absent. Original FisherRF needs its [modified CUDA rasterizer/knn/Hessian extensions](https://github.com/JiangWenPL/FisherRF#environment-setup); this revision implements its Fisher algorithm with the explicitly declared CPU radiance backend.
+[AIR-OSVP](https://github.com/psc0628/AIR-OSVP) is pinned to `6847c0a57ca3b4e9d9a82d4cbf12f08074f71a89`. Its [installation](https://github.com/psc0628/AIR-OSVP/blob/main/poco_pointr/README.md) uses POCO/PoinTr and compiled Pointnet2/Chamfer. [FisherRF’s CUDA backend](https://github.com/JiangWenPL/FisherRF#environment-setup) is an upstream option; this package’s FisherRF entry uses the CPU radiance backend.
 
-## Original AIR-OSVP execution entry
+## AIR-OSVP execution
 
-`air_osvp.py` now supplies a direct original-source pipeline, in addition to the generic trace evaluator. It fetches pinned AIR-OSVP, PoinTr and POCO source trees and their submodules, retains upstream licenses and applies exactly the author-documented source overlay in a private workspace. Author model/script source is fetched at runtime rather than redistributed here (the pinned AIR repository has no root license). It executes the original POCO `train_and_infer_one.py`, then the original COSC `infer_once.py`; it does not accept an arbitrary predicted-view file as native inference.
+`air_osvp.py` runs the upstream pipeline. It fetches pinned AIR-OSVP, PoinTr and POCO source trees and their submodules, retains upstream licenses and applies exactly the author-documented source overlay in a private workspace. Author model/script source is fetched at runtime rather than redistributed here (the pinned AIR repository has no root license). It executes the original POCO `train_and_infer_one.py`, then the original COSC `infer_once.py`.
 
 ```bash
 python -m evidenceconserve.air_osvp fetch --output .deps/air-sources
@@ -161,21 +159,19 @@ python -m evidenceconserve.air_osvp infer --data data/air-episodes.jsonl --works
 python -m evidenceconserve.external calibrate --data runs/air-calibration/traces.jsonl --policy-config runs/air-calibration/policy.json --development-objects data/air-development.json --output checkpoints/air-calibration.json
 ```
 
-Install/build the original dependency stack using its retained README or the isolated recipe below. Public original POCO weights are linked by the AIR installation to [POCO's ShapeNet release](https://github.com/valeoai/POCO/releases/download/v0.0.0/ShapeNet_3k.zip); COSC data/weights are linked to [the author's Kaggle dataset](https://www.kaggle.com/datasets/sicongpan/air-osvp-dataset). `preflight` reaches compiled imports before checking checkpoints. The original [Chamfer setup](https://github.com/yuxumin/PoinTr/blob/master/extensions/chamfer_dist/setup.py) and [pointnet2 setup](https://github.com/erikwijmans/Pointnet2_PyTorch/blob/master/pointnet2_ops_lib/setup.py) execute actual CUDAExtension/BuildExtension sources in the private Linux prefix; an alternate CPU algorithm is not substituted.
+Install/build the original dependency stack using its retained README or the isolated recipe below. Public original POCO weights are linked by the AIR installation to [POCO's ShapeNet release](https://github.com/valeoai/POCO/releases/download/v0.0.0/ShapeNet_3k.zip); COSC data/weights are linked to [the author's Kaggle dataset](https://www.kaggle.com/datasets/sicongpan/air-osvp-dataset). `preflight` reaches compiled imports before checking checkpoints. The original [Chamfer setup](https://github.com/yuxumin/PoinTr/blob/master/extensions/chamfer_dist/setup.py) and [pointnet2 setup](https://github.com/erikwijmans/Pointnet2_PyTorch/blob/master/pointnet2_ops_lib/setup.py) execute actual CUDAExtension/BuildExtension sources in the private Linux prefix.
 
 Each episode retains the common graph/budget/start-view metadata and adds `views[j].air_view_id` (unique original index 0–31) and calibrated `air_to_world[4,4]`. Camera centres must match the original `view_space_32.txt` transformed into the common world; original view directions point towards the object. The initial view's `air_inputs` provides `observed_view_indices: [start_view]` and paths, relative to the episode JSONL, to `surface` [N,3] observed points, `scene` [M,4] xyz plus binary observed/free-space occupancy supervision, and `bbx` [Q,3] prior-box query points. Points are in the original AIR object frame. These are exactly the author's POCO input contracts read by `datasets/cosc.py`; future scans, full object truth and class labels must not produce the input supervision. The POCO ShapeNet prior is fine-tuned on the initial observation (author default ten epochs; one epoch may be used for a functionality check).
 
-COSC returns the original 32-way sigmoid thresholded at .5. The wrapper keeps that set unchanged, removes the already captured start, and enumerates the minimum-cost legal ordering using the same directed graph charges and maximum captures. Off-graph, unreachable or over-budget batches are explicitly rejected; no extra numeric selector prunes the original output. Exact routing supports up to eight additional views, covering the paper's six-capture setting. Only selected RGB images enter the same frozen evidence encoder; trace eligibility uses the shared candidate risk-reduction model and the same minimum-view rule. `traces.jsonl` and `policy.json` then enter the existing independent episode calibration/evaluation commands. Include all encoder/COSC/POCO fitting and configuration-selection objects in the development registration.
+COSC returns the original 32-way sigmoid thresholded at .5. The wrapper keeps that set unchanged, removes the already captured start, and enumerates the minimum-cost legal ordering using the same directed graph charges and maximum captures. Off-graph, unreachable or over-budget batches are explicitly rejected; no extra numeric selector prunes the original output. Exact routing supports up to eight additional views. Only selected RGB images enter the same frozen evidence encoder; trace eligibility uses the shared candidate risk-reduction model and the same minimum-view rule. `traces.jsonl` and `policy.json` then enter the existing independent episode calibration/evaluation commands. Include all encoder/COSC/POCO fitting and configuration-selection objects in the development registration.
 
 ```bash
 python verify_air_glue.py --native-fixture runs/native-functional --output runs/air-glue
 ```
 
-Generated routing/trace checks verify the unchanged batch's hand route [0,2,1] and cost 3, budget/off-graph/duplicate rejection, label isolation, selected-only shared-encoder capture and trace readback. These cover graph/classifier glue; the separate original CUDA execution check below covers actual POCO/COSC algorithms.
+`verify_air_glue.py` checks graph routing, batch charging, selected-only capture and trace serialization with generated inputs.
 
-The extended CPU smoke also passed learned-head fitting/save/load, registration JSON, independent object calibration and replay, exact oracle hand cost/regret and inserted-copy zero increment. External adapters were checked with explicitly generated functionality fixtures; these are not runs of the named learned baselines.
-
-## Original CUDA baseline environment and one-capture check
+## CUDA environment and public capture
 
 The standalone helpers in `native/` use a separate Linux Python 3.10 / PyTorch 2.0.1+cu118 / GCC 11 / CUDA 11.8 prefix. They do not change the main project's environment. CUDA development headers for cuSPARSE, cuBLAS and cuSOLVER are required in addition to nvcc/cudart. The isolated [MetricDamage CUDA bootstrap](https://github.com/Hqa77880011/MetricDamage/blob/main/native/cuda/bootstrap.py) creates this prefix without system installs; AIR's remaining dependencies are listed in `native/requirements-air.txt`.
 
@@ -191,8 +187,6 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 "$PREFIX/bin/python" 
 
 Use the `air_osvp fetch` / `prepare` commands above to create `WORK` before building. `build_air_cuda.py` compiles the original Pointnet2 and PoinTr Chamfer sources for the actual GPU, checks original CUDA FPS on four hand points and checks Chamfer distance/backward against a hand-sized distance calculation. Compatibility changes select the GPU architecture, restrict PoinTr's import-time registry to COSC, change POCO transforms to PyG 2.x `Data.keys()`, and put voxel-grid batch indices on the point tensor's device. COSC/POCO networks, attention/convolution math, native kernels, losses and the original optimizer step are preserved.
 
-`fetch_air_assets.py` retrieves the author's actual COSC checkpoint, POCO's released ShapeNet checkpoint and only `Asian_Dragon/rotate_0/cloud_0.txt` from public AIR dataset version 1. `verify_air_cuda.py` executes the original `train_and_infer_one.py` for one adaptation update and the original `infer_once.py` for COSC. It records actual gradients/weight changes, original native FPS calls, the full 32 probabilities and unchanged .5-threshold batch. Failed stages remain errors; completed `--stage poco` / `--stage cosc` results can be collected with `--stage report` without another adaptation update.
+`fetch_air_assets.py` retrieves the author's actual COSC checkpoint, POCO's released ShapeNet checkpoint and only `Asian_Dragon/rotate_0/cloud_0.txt` from public AIR dataset version 1. `verify_air_cuda.py` executes the original `train_and_infer_one.py` for one adaptation update and the original `infer_once.py` for COSC. It records actual gradients/weight changes, original native FPS calls, the full 32 probabilities and unchanged .5-threshold batch. Completed `--stage poco` / `--stage cosc` results can be collected with `--stage report`.
 
-The declared `public-single-capture-v1` check derives occupied endpoints and free-ray supervision only from that one observed cloud and original view-0 camera centre. A fixed 20 cm prior box supplies a 48³ query grid; 2,048 manifold and 1,024 nonmanifold training points bound the single update. These are explicit functionality settings, with no future clouds, object class or ground-truth shape inputs. Public original RGB/physical-graph episodes and the manuscript's exact scene construction are still needed for the original common-task benchmark. The existing unchanged-batch routing rejects a native set that exceeds the shared graph budget; it never prunes that set to manufacture a successful comparison.
-
-On 2026-11-01 the original CUDA FPS/Chamfer and complete POCO→COSC stages passed on the RTX 4060 Laptop GPU. The 3,583-point single capture produced one POCO update with gradient norm 7.69335, 238 gradient tensors and L1 parameter change 12,579.4336; its 1,161 completed points entered the original 14,971,680-parameter COSC, including actual native FPS calls at 512 and 256 centres. Peak torch allocation was 3,066,641,920 bytes for POCO and 225,563,648 for COSC. The original .5-threshold set was `[1,10,15,18,20,26]`, unchanged. Actual `charge_batch` rejects the seven total captures at budget six and accepts budget seven on a declared complete 32-view public graph: route `[0,20,15,26,1,10,18]`, cost 8.511185698. This graph uses unit capture plus Euclidean travel cost and is explicitly not the missing original physical graph. Raw probabilities, completion, update/call counts and rejection reason are retained; no performance figure or full training is claimed.
+`public-single-capture-v1` derives occupied endpoints and free-ray supervision from one observed cloud and the view-0 camera centre. A 20cm prior box supplies a 48³ query grid; 2,048 manifold and 1,024 nonmanifold points bound the update. Routing preserves COSC’s complete thresholded batch and rejects batches exceeding the graph’s shared budget.

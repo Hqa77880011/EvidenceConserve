@@ -1,12 +1,10 @@
-"""Train frozen candidate/geometry predictors from object-disjoint cached features.
+"""Train candidate and geometry predictors from object-disjoint cached features.
 
 Cache keys: candidate_features (N,F), evidence (N,C), optional quality (N,),
 candidate_group/candidate_split (N,); overlap_features (M,G), overlap (M,),
-overlap_group/overlap_split (M,). Targets are offline supervision. Features
-must be available before capture; class labels are never prediction inputs.
-The small MLPs and ensemble spread are implementation choices, not recovered
-original experiment models or calibrated uncertainty bounds.
-"""
+overlap_group/overlap_split (M,). Targets provide offline supervision.
+Features must be available before capture; labels are excluded from inputs.
+Ensemble spread describes predictor variation."""
 import argparse
 import copy
 import json

@@ -1,4 +1,4 @@
-"""Small native image/transport/PPO/RF checks; generated data are not paper results."""
+"""Native image, transport, PPO and radiance-field checks with generated data."""
 
 import argparse
 import copy
